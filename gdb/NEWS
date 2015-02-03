@@ -3,6 +3,10 @@
 
 *** Changes since GDB 7.9
 
+* Support for process record-replay and reverse debugging on aarch64*-linux*
+  targets has been added.  GDB now supports recording of A64 instruction set
+  including advance SIMD instructions.
+
 * The "info source" command now displays the producer string if it was
   present in the debug info.  This typically includes the compiler version
   and may include things like its command line arguments.
