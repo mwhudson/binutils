@@ -88,6 +88,9 @@ struct gdbarch_tdep
   struct type *vns_type;
   struct type *vnh_type;
   struct type *vnb_type;
+
+  /* syscall record.  */
+  int (*aarch64_syscall_record) (struct regcache *regcache, unsigned long svc_number);
 };
 
 extern int aarch64_process_record (struct gdbarch *gdbarch,

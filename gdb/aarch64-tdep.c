@@ -3002,7 +3002,20 @@ aarch64_record_branch_except_sys (insn_decode_record *aarch64_insn_r)
     {
       /* Exception generation instructions. */
       if (insn_bits24_27 == 0x04)
-        return AARCH64_RECORD_UNSUPPORTED;
+        {
+          if (!bits (aarch64_insn_r->aarch64_insn, 2, 4) &&
+              !bits (aarch64_insn_r->aarch64_insn, 21, 23) &&
+               bits (aarch64_insn_r->aarch64_insn, 0, 1) == 0x01)
+            {
+              ULONGEST svc_number;
+              regcache_raw_read_unsigned (aarch64_insn_r->regcache, 8,
+                                          &svc_number);
+              return tdep->aarch64_syscall_record (aarch64_insn_r->regcache,
+                                                   svc_number);
+            }
+          else
+            return AARCH64_RECORD_UNSUPPORTED;
+        }
       /* System instructions. */
       else if (insn_bits24_27 == 0x05 && insn_bits22_23 == 0x00)
         {
