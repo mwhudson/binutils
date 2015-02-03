@@ -385,6 +385,9 @@ aarch64_linux_init_abi (struct gdbarch_info info, struct gdbarch *gdbarch)
   set_gdbarch_stap_is_single_operand (gdbarch, aarch64_stap_is_single_operand);
   set_gdbarch_stap_parse_special_token (gdbarch,
 					aarch64_stap_parse_special_token);
+
+  /* Reversible debugging, process record.  */
+  set_gdbarch_process_record (gdbarch, aarch64_process_record);
 }
 
 /* Provide a prototype to silence -Wmissing-prototypes.  */

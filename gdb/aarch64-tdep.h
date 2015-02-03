@@ -90,4 +90,7 @@ struct gdbarch_tdep
   struct type *vnb_type;
 };
 
+extern int aarch64_process_record (struct gdbarch *gdbarch,
+                               struct regcache *regcache, CORE_ADDR addr);
+
 #endif /* aarch64-tdep.h */

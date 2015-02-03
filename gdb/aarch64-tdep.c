@@ -50,6 +50,9 @@
 
 #include "vec.h"
 
+#include "record.h"
+#include "record-full.h"
+
 #include "features/aarch64.c"
 
 /* Pseudo register base numbers.  */
@@ -2803,4 +2806,579 @@ When on, AArch64 specific debugging is enabled."),
 			    NULL,
 			    show_aarch64_debug,
 			    &setdebuglist, &showdebuglist);
+}
+
+/* AArch64 process record-replay related structures, defines etc.  */
+
+#define submask(x) ((1L << ((x) + 1)) - 1)
+#define bit(obj,st) (((obj) >> (st)) & 1)
+#define bits(obj,st,fn) (((obj) >> (st)) & submask ((fn) - (st)))
+
+#define REG_ALLOC(REGS, LENGTH, RECORD_BUF) \
+        do  \
+          { \
+            unsigned int reg_len = LENGTH; \
+            if (reg_len) \
+              { \
+                REGS = XNEWVEC (uint32_t, reg_len); \
+                memcpy(&REGS[0], &RECORD_BUF[0], sizeof(uint32_t)*LENGTH); \
+              } \
+          } \
+        while (0)
+
+#define MEM_ALLOC(MEMS, LENGTH, RECORD_BUF) \
+        do  \
+          { \
+            unsigned int mem_len = LENGTH; \
+            if (mem_len) \
+            { \
+              MEMS =  XNEWVEC (struct aarch64_mem_r, mem_len);  \
+              memcpy(&MEMS->len, &RECORD_BUF[0], \
+                     sizeof(struct aarch64_mem_r) * LENGTH); \
+            } \
+          } \
+          while (0)
+
+/* AArch64 memory record structure.  */
+struct aarch64_mem_r
+{
+  uint64_t len;    /* Record length.  */
+  uint64_t addr;   /* Memory address.  */
+};
+
+enum aarch64_record_result
+{
+  AARCH64_RECORD_SUCCESS,
+  AARCH64_RECORD_FAILURE,
+  AARCH64_RECORD_UNSUPPORTED
+};
+
+/* AArch64 instruction record contains opcode of current insn and execution
+   state (before entry to decode_insn()), contains list of to-be-modified
+   registers and memory blocks (on return from decode_insn()).  */
+
+typedef struct insn_decode_record_t
+{
+  struct gdbarch *gdbarch;
+  struct regcache *regcache;
+  CORE_ADDR this_addr;
+  uint32_t aarch64_insn;
+  uint32_t mem_rec_count;
+  uint32_t reg_rec_count;
+  uint32_t *aarch64_regs;
+  struct aarch64_mem_r *aarch64_mems;
+} insn_decode_record;
+
+/* Record handler for data processing - register instructions.  */
+static unsigned int
+aarch64_record_data_proc_reg (insn_decode_record *aarch64_insn_r)
+{
+  uint8_t reg_rd, insn_bits24_27, insn_bits21_23, setflags;
+  uint32_t record_buf[4];
+
+  reg_rd = bits (aarch64_insn_r->aarch64_insn, 0, 4);
+  insn_bits24_27 = bits (aarch64_insn_r->aarch64_insn, 24, 27);
+  insn_bits21_23 = bits (aarch64_insn_r->aarch64_insn, 21, 23);
+
+  if (!bit (aarch64_insn_r->aarch64_insn, 28))
+    {
+      /* Logical (shifted register).  */
+      if (insn_bits24_27 == 0x0a)
+        setflags = (bits (aarch64_insn_r->aarch64_insn, 29, 30) == 0x03);
+      /* Add/subtract.  */
+      else if (insn_bits24_27 == 0x0b)
+        setflags = bit (aarch64_insn_r->aarch64_insn, 29);
+      else
+        return AARCH64_RECORD_UNSUPPORTED;
+
+      record_buf[0] = reg_rd;
+      aarch64_insn_r->reg_rec_count = 1;
+      if (setflags)
+        record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_CPSR_REGNUM;
+    }
+  else
+    {
+      if (insn_bits24_27 == 0x0b)
+        {
+          /* Data-processing (3 source).  */
+          record_buf[0] = reg_rd;
+          aarch64_insn_r->reg_rec_count = 1;
+        }
+      else if (insn_bits24_27 == 0x0a)
+        {
+          if (insn_bits21_23 == 0x00)
+            {
+              /* Add/subtract (with carry).  */
+              record_buf[0] = reg_rd;
+              aarch64_insn_r->reg_rec_count = 1;
+              if (bit (aarch64_insn_r->aarch64_insn, 29))
+                {
+                  record_buf[1] = AARCH64_CPSR_REGNUM;
+                  aarch64_insn_r->reg_rec_count = 2;
+                }
+            }
+          else if (insn_bits21_23 == 0x02)
+            {
+              /* Conditional compare (register) / Conditional compare (immediate).  */
+              record_buf[0] = AARCH64_CPSR_REGNUM;
+              aarch64_insn_r->reg_rec_count = 1;
+            }
+          else if (insn_bits21_23 == 0x04 || insn_bits21_23 == 0x06)
+            {
+              /* CConditional select.  */
+              /* Data-processing (2 source).  */
+              /* Data-processing (1 source).  */
+              record_buf[0] = reg_rd;
+              aarch64_insn_r->reg_rec_count = 1;
+            }
+          else
+            return AARCH64_RECORD_UNSUPPORTED;
+        }
+    }
+
+  REG_ALLOC (aarch64_insn_r->aarch64_regs, aarch64_insn_r->reg_rec_count,
+            record_buf);
+  return AARCH64_RECORD_SUCCESS;
+}
+
+/* Record handler for data processing - immediate instructions.  */
+static unsigned int
+aarch64_record_data_proc_imm (insn_decode_record *aarch64_insn_r)
+{
+  uint8_t reg_rd, insn_bit28, insn_bit23, insn_bits24_27, setflags;
+  uint32_t record_buf[4];
+
+  reg_rd = bits (aarch64_insn_r->aarch64_insn, 0, 4);
+  insn_bit28 = bit (aarch64_insn_r->aarch64_insn, 28);
+  insn_bit23 = bit (aarch64_insn_r->aarch64_insn, 23);
+  insn_bits24_27 = bits (aarch64_insn_r->aarch64_insn, 24, 27);
+
+  /* PC rel addressing / Move wide immediate / BitField / Extract.  */
+  if (insn_bits24_27 == 0x00 || insn_bits24_27 == 0x03 ||
+     (insn_bits24_27 == 0x02 && insn_bit23))
+    {
+      record_buf[0] = reg_rd;
+      aarch64_insn_r->reg_rec_count = 1;
+    }
+  else if (insn_bits24_27 == 0x01)
+    {
+      /* Add/Subtract (immediate).  */
+      setflags = bit (aarch64_insn_r->aarch64_insn, 29);
+      record_buf[0] = reg_rd;
+      aarch64_insn_r->reg_rec_count = 1;
+      if (setflags)
+        record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_CPSR_REGNUM;
+    }
+  else if (insn_bits24_27 == 0x02 && !insn_bit23)
+    {
+      /* Logical (immediate).  */
+      setflags = bits (aarch64_insn_r->aarch64_insn, 29, 30) == 0x03;
+      record_buf[0] = reg_rd;
+      aarch64_insn_r->reg_rec_count = 1;
+      if (setflags)
+        record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_CPSR_REGNUM;
+    }
+  else
+    return AARCH64_RECORD_UNSUPPORTED;
+
+  REG_ALLOC (aarch64_insn_r->aarch64_regs, aarch64_insn_r->reg_rec_count,
+            record_buf);
+  return AARCH64_RECORD_SUCCESS;
+}
+
+/* Record handler for branch, exception generation and system instructions.  */
+static unsigned int
+aarch64_record_branch_except_sys (insn_decode_record *aarch64_insn_r)
+{
+  struct gdbarch_tdep *tdep = gdbarch_tdep (aarch64_insn_r->gdbarch);
+  uint8_t insn_bits24_27, insn_bits28_31, insn_bits22_23;
+  uint32_t record_buf[4];
+
+  insn_bits24_27 = bits (aarch64_insn_r->aarch64_insn, 24, 27);
+  insn_bits28_31 = bits (aarch64_insn_r->aarch64_insn, 28, 31);
+  insn_bits22_23 = bits (aarch64_insn_r->aarch64_insn, 22, 23);
+
+  if (insn_bits28_31 == 0x0d)
+    {
+      /* Exception generation instructions. */
+      if (insn_bits24_27 == 0x04)
+        return AARCH64_RECORD_UNSUPPORTED;
+      /* System instructions. */
+      else if (insn_bits24_27 == 0x05 && insn_bits22_23 == 0x00)
+        {
+          record_buf[0] = AARCH64_CPSR_REGNUM;
+          record_buf[1] = bits (aarch64_insn_r->aarch64_insn, 0, 4);
+          aarch64_insn_r->reg_rec_count = 2;
+        }
+      else if((insn_bits24_27 & 0x0e) == 0x06)
+        {
+          record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_PC_REGNUM;
+          if (bits (aarch64_insn_r->aarch64_insn, 21, 22) == 0x01)
+            record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_LR_REGNUM;
+        }
+      else
+        return AARCH64_RECORD_UNSUPPORTED;
+    }
+  else if ((insn_bits28_31 & 0x07) == 0x01 && (insn_bits24_27 & 0x0c) == 0x04)
+    {
+      record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_PC_REGNUM;
+      if (bit (aarch64_insn_r->aarch64_insn, 31))
+        record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_LR_REGNUM;
+    }
+  else
+    /* All other types of branch instructions. */
+    record_buf[aarch64_insn_r->reg_rec_count++] = AARCH64_PC_REGNUM;
+
+  REG_ALLOC (aarch64_insn_r->aarch64_regs, aarch64_insn_r->reg_rec_count,
+            record_buf);
+  return AARCH64_RECORD_SUCCESS;
+}
+
+/* Record handler for load and store instructions.  */
+static unsigned int
+aarch64_record_load_store (insn_decode_record *aarch64_insn_r)
+{
+  uint8_t insn_bits24_27, insn_bits28_29, insn_bits10_11;
+  uint8_t insn_bit23, insn_bit21;
+  uint8_t opc, size_bits, ld_flag, vector_flag;
+  uint32_t reg_rn, reg_rt, reg_rt2;
+  uint64_t datasize, offset;
+  uint32_t record_buf[8];
+  uint64_t record_buf_mem[8];
+  CORE_ADDR address;
+
+  insn_bits10_11 = bits (aarch64_insn_r->aarch64_insn, 10, 11);
+  insn_bits24_27 = bits (aarch64_insn_r->aarch64_insn, 24, 27);
+  insn_bits28_29 = bits (aarch64_insn_r->aarch64_insn, 28, 29);
+  insn_bit21 = bit (aarch64_insn_r->aarch64_insn, 21);
+  insn_bit23 = bit (aarch64_insn_r->aarch64_insn, 23);
+  ld_flag = bit (aarch64_insn_r->aarch64_insn, 22);
+  vector_flag = bit (aarch64_insn_r->aarch64_insn, 26);
+  reg_rt = bits (aarch64_insn_r->aarch64_insn, 0, 4);
+  reg_rn = bits (aarch64_insn_r->aarch64_insn, 5, 9);
+  reg_rt2 = bits (aarch64_insn_r->aarch64_insn, 10, 14);
+  size_bits = bits (aarch64_insn_r->aarch64_insn, 30, 31);
+
+  /* Load/store exclusive instructions decoding.  */
+  if (insn_bits24_27 == 0x08 && insn_bits28_29 == 0x00)
+    {
+      if (ld_flag)
+        {
+          record_buf[0] = reg_rt;
+          aarch64_insn_r->reg_rec_count = 1;
+          if (insn_bit21)
+            {
+              record_buf[1] = reg_rt2;
+              aarch64_insn_r->reg_rec_count = 2;
+            }
+        }
+      else
+        {
+          if (insn_bit21)
+            datasize = (8 << size_bits) * 2;
+          else
+            datasize = (8 << size_bits);
+          regcache_raw_read_unsigned (aarch64_insn_r->regcache, reg_rn,
+                                      &address);
+          record_buf_mem[0] = datasize / 8;
+          record_buf_mem[1] = address;
+          aarch64_insn_r->mem_rec_count = 1;
+          if (!insn_bit23)
+            {
+              /* Save register rs.  */
+              record_buf[0] = bits (aarch64_insn_r->aarch64_insn, 16, 20);
+              aarch64_insn_r->reg_rec_count = 1;
+            }
+        }
+    }
+  /* Load register (literal) instructions decoding.  */
+  else if ((insn_bits24_27 & 0x0b) == 0x08 && insn_bits28_29 == 0x01)
+    {
+      if (vector_flag)
+        record_buf[0] = reg_rt + AARCH64_V0_REGNUM;
+      else
+        record_buf[0] = reg_rt;
+      aarch64_insn_r->reg_rec_count = 1;
+    }
+  /* All types of load/store pair instructions decoding.  */
+  else if ((insn_bits24_27 & 0x0a) == 0x08 && insn_bits28_29 == 0x02)
+    {
+      if (ld_flag)
+        {
+          if (vector_flag)
+            {
+              record_buf[0] = reg_rt + AARCH64_V0_REGNUM;
+              record_buf[1] = reg_rt2 + AARCH64_V0_REGNUM;
+            }
+          else
+            {
+              record_buf[0] = reg_rt;
+              record_buf[1] = reg_rt2;
+            }
+          aarch64_insn_r->reg_rec_count = 2;
+        }
+      else
+        {
+          uint16_t imm7_off;
+          imm7_off = bits (aarch64_insn_r->aarch64_insn, 15, 21);
+          if (!vector_flag)
+            size_bits = size_bits >> 1;
+          datasize = 8 << (2 + size_bits);
+          offset = (imm7_off & 0x40) ? (~imm7_off & 0x007f) + 1 : imm7_off;
+          offset = offset << (2 + size_bits);
+          regcache_raw_read_unsigned (aarch64_insn_r->regcache, reg_rn,
+                                      &address);
+          if (!((insn_bits24_27 & 0x0b) == 0x08 && insn_bit23))
+            {
+              if (imm7_off & 0x40)
+                address = address - offset;
+              else
+                address = address + offset;
+            }
+
+          record_buf_mem[0] = datasize / 8;
+          record_buf_mem[1] = address;
+          record_buf_mem[2] = datasize / 8;
+          record_buf_mem[3] = address + (datasize / 8);
+          aarch64_insn_r->mem_rec_count = 2;
+        }
+      if (bit (aarch64_insn_r->aarch64_insn, 23))
+        record_buf[aarch64_insn_r->reg_rec_count++] = reg_rn;
+    }
+  /* Load/store register (unsigned immediate) instructions.  */
+  else if ((insn_bits24_27 & 0x0b) == 0x09 && insn_bits28_29 == 0x03)
+    {
+      opc = bits (aarch64_insn_r->aarch64_insn, 22, 23);
+      if (!(opc >> 1))
+        if (opc & 0x01)
+          ld_flag = 0x01;
+        else
+          ld_flag = 0x0;
+      else
+        if (size_bits != 0x03)
+          ld_flag = 0x01;
+        else
+          return AARCH64_RECORD_UNSUPPORTED;
+
+      if (!ld_flag)
+        {
+          offset = bits (aarch64_insn_r->aarch64_insn, 10, 21);
+          datasize = 8 << size_bits;
+          regcache_raw_read_unsigned (aarch64_insn_r->regcache, reg_rn,
+                                      &address);
+          offset = offset << size_bits;
+          address = address + offset;
+
+          record_buf_mem[0] = datasize >> 3;
+          record_buf_mem[1] = address;
+          aarch64_insn_r->mem_rec_count = 1;
+        }
+      else
+        {
+          if (vector_flag)
+            record_buf[0] = reg_rt + AARCH64_V0_REGNUM;
+          else
+            record_buf[0] = reg_rt;
+          aarch64_insn_r->reg_rec_count = 1;
+        }
+    }
+  /* Load/store register (register offset) instructions.  */
+  else if ((insn_bits24_27 & 0x0b) == 0x08 && insn_bits28_29 == 0x03 &&
+            insn_bits10_11 == 0x02 && insn_bit21)
+    {
+      opc = bits (aarch64_insn_r->aarch64_insn, 22, 23);
+      if (!(opc >> 1))
+        if (opc & 0x01)
+          ld_flag = 0x01;
+        else
+          ld_flag = 0x0;
+      else
+        if (size_bits != 0x03)
+          ld_flag = 0x01;
+        else
+          return AARCH64_RECORD_UNSUPPORTED;
+
+      if (!ld_flag)
+        {
+          uint64_t reg_rm_val;
+          regcache_raw_read_unsigned (aarch64_insn_r->regcache,
+                     bits (aarch64_insn_r->aarch64_insn, 16, 20), &reg_rm_val);
+          if (bit (aarch64_insn_r->aarch64_insn, 12))
+            offset = reg_rm_val << size_bits;
+          else
+            offset = reg_rm_val;
+          datasize = 8 << size_bits;
+          regcache_raw_read_unsigned (aarch64_insn_r->regcache, reg_rn,
+                                      &address);
+          address = address + offset;
+          record_buf_mem[0] = datasize >> 3;
+          record_buf_mem[1] = address;
+          aarch64_insn_r->mem_rec_count = 1;
+        }
+      else
+        {
+          if (vector_flag)
+            record_buf[0] = reg_rt + AARCH64_V0_REGNUM;
+          else
+            record_buf[0] = reg_rt;
+          aarch64_insn_r->reg_rec_count = 1;
+        }
+    }
+  /* Load/store register (immediate) instructions.  */
+  else if ((insn_bits24_27 & 0x0b) == 0x08 && insn_bits28_29 == 0x03 &&
+          !insn_bit21)
+    {
+      opc = bits (aarch64_insn_r->aarch64_insn, 22, 23);
+      if (!(opc >> 1))
+        if (opc & 0x01)
+          ld_flag = 0x01;
+        else
+          ld_flag = 0x0;
+      else
+        if (size_bits != 0x03)
+          ld_flag = 0x01;
+        else
+          return AARCH64_RECORD_UNSUPPORTED;
+
+      if (!ld_flag)
+        {
+          uint16_t imm9_off;
+          imm9_off = bits (aarch64_insn_r->aarch64_insn, 12, 20);
+          offset = (imm9_off & 0x0100) ? (((~imm9_off) & 0x01ff) + 1) : imm9_off;
+          datasize = 8 << size_bits;
+          regcache_raw_read_unsigned (aarch64_insn_r->regcache, reg_rn,
+                                      &address);
+          if (insn_bits10_11 != 0x01)
+            {
+              if (imm9_off & 0x0100)
+                address = address - offset;
+              else
+                address = address + offset;
+            }
+          record_buf_mem[0] = datasize >> 3;
+          record_buf_mem[1] = address;
+          aarch64_insn_r->mem_rec_count = 1;
+        }
+      else
+        {
+          if (vector_flag)
+            record_buf[0] = reg_rt + AARCH64_V0_REGNUM;
+          else
+            record_buf[0] = reg_rt;
+          aarch64_insn_r->reg_rec_count = 1;
+        }
+      if (insn_bits10_11 == 0x01 || insn_bits10_11 == 0x03)
+        record_buf[aarch64_insn_r->reg_rec_count++] = reg_rn;
+    }
+  /* Advanced SIMD load/store instructions.  */
+  else
+    return AARCH64_RECORD_UNSUPPORTED;
+
+  MEM_ALLOC (aarch64_insn_r->aarch64_mems, aarch64_insn_r->mem_rec_count,
+             record_buf_mem);
+  REG_ALLOC (aarch64_insn_r->aarch64_regs, aarch64_insn_r->reg_rec_count,
+             record_buf);
+  return AARCH64_RECORD_SUCCESS;
+}
+/* Decodes insns type and invokes its record handler.  */
+
+static unsigned int
+aarch64_record_decode_insn_handler (insn_decode_record *aarch64_insn_r)
+{
+  uint32_t ins_bit25, ins_bit26, ins_bit27, ins_bit28;
+
+  ins_bit25 = bit (aarch64_insn_r->aarch64_insn, 25);
+  ins_bit26 = bit (aarch64_insn_r->aarch64_insn, 26);
+  ins_bit27 = bit (aarch64_insn_r->aarch64_insn, 27);
+  ins_bit28 = bit (aarch64_insn_r->aarch64_insn, 28);
+
+  /* Data processing - immediate instructions.  */
+  if (!ins_bit26 && !ins_bit27 && ins_bit28)
+    return aarch64_record_data_proc_imm (aarch64_insn_r);
+
+  /* Branch, exception generation and system instructions.  */
+  if (ins_bit26 && !ins_bit27 && ins_bit28)
+    return aarch64_record_branch_except_sys (aarch64_insn_r);
+
+  /* Load and store instructions.  */
+  if (!ins_bit25 && ins_bit27)
+    return aarch64_record_load_store (aarch64_insn_r);
+
+  /* Data processing - register instructions.  */
+  if (ins_bit25 && !ins_bit26 && ins_bit27)
+    return aarch64_record_data_proc_reg (aarch64_insn_r);
+
+  /* Data processing - SIMD and floating point instructions.  */
+  if (ins_bit25 && ins_bit26 && ins_bit27)
+    return AARCH64_RECORD_UNSUPPORTED;
+
+  return AARCH64_RECORD_UNSUPPORTED;
+}
+
+/* Cleans up local record registers and memory allocations.  */
+
+static void
+deallocate_reg_mem (insn_decode_record *record)
+{
+  xfree (record->aarch64_regs);
+  xfree (record->aarch64_mems);
+}
+
+/* Parse the current instruction and record the values of the registers and
+   memory that will be changed in current instruction to record_arch_list
+   return -1 if something is wrong.  */
+
+int
+aarch64_process_record (struct gdbarch *gdbarch, struct regcache *regcache,
+                        CORE_ADDR insn_addr)
+{
+  uint32_t rec_no = 0;
+  uint8_t insn_size = 4;
+  uint32_t ret = 0;
+  ULONGEST t_bit = 0, insn_id = 0;
+  gdb_byte buf[insn_size];
+  insn_decode_record aarch64_record;
+
+  memset (&buf[0], 0, insn_size);
+  memset (&aarch64_record, 0, sizeof (insn_decode_record));
+  target_read_memory (insn_addr, &buf[0], insn_size);
+  aarch64_record.aarch64_insn = (uint32_t) extract_unsigned_integer (&buf[0],
+                                insn_size, gdbarch_byte_order (gdbarch));
+  aarch64_record.regcache = regcache;
+  aarch64_record.this_addr = insn_addr;
+  aarch64_record.gdbarch = gdbarch;
+
+  ret = aarch64_record_decode_insn_handler (&aarch64_record);
+  if (ret == AARCH64_RECORD_UNSUPPORTED)
+    {
+      printf_unfiltered (_("Process record does not support instruction "
+                        "0x%0x at address %s.\n"),aarch64_record.aarch64_insn,
+                        paddress (gdbarch, insn_addr));
+      ret = -1;
+    }
+
+  if (0 == ret)
+    {
+      /* Record registers.  */
+      record_full_arch_list_add_reg (aarch64_record.regcache, AARCH64_PC_REGNUM);
+      if (aarch64_record.aarch64_regs)
+        for (rec_no = 0; rec_no < aarch64_record.reg_rec_count; rec_no++)
+          if (record_full_arch_list_add_reg (aarch64_record.regcache,
+             aarch64_record.aarch64_regs[rec_no]))
+            ret = -1;
+
+      /* Record memories.  */
+      if (aarch64_record.aarch64_mems)
+        for (rec_no = 0; rec_no < aarch64_record.mem_rec_count; rec_no++)
+          if (record_full_arch_list_add_mem
+             ((CORE_ADDR)aarch64_record.aarch64_mems[rec_no].addr,
+             aarch64_record.aarch64_mems[rec_no].len))
+            ret = -1;
+
+      if (record_full_arch_list_add_end ())
+        ret = -1;
+    }
+
+  deallocate_reg_mem (&aarch64_record);
+  return ret;
 }
